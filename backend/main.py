@@ -1,24 +1,39 @@
 """
 VoltWise AI - Dedicated Backend REST API Server
 AI-Based Electricity Bill Prediction and Consumption Optimization System
+Supports Multi-User Account Isolation & Dedicated Database Storage
 """
 
 import math
 from typing import List, Optional, Dict, Any
 
 try:
-    from fastapi import FastAPI
+    from fastapi import FastAPI, HTTPException, status
     from fastapi.middleware.cors import CORSMiddleware
     from pydantic import BaseModel
     FASTAPI_AVAILABLE = True
 except ImportError:
     FASTAPI_AVAILABLE = False
 
+try:
+    from database import (
+        init_database,
+        create_user,
+        authenticate_user,
+        get_user_by_id,
+        list_all_users,
+        update_user_profile,
+        sync_user_appliances
+    )
+    DATABASE_AVAILABLE = True
+except ImportError:
+    DATABASE_AVAILABLE = False
+
 if FASTAPI_AVAILABLE:
     app = FastAPI(
-        title="VoltWise AI - Energy Management & Bill Prediction API",
-        description="REST API for Telescopic Tariff Billing, Seasonal ML Forecasting, and AI Energy Optimization",
-        version="2.0.0"
+        title="VoltWise AI - Energy Management & Multi-Account API",
+        description="REST API with Dedicated Database Isolation, Telescopic Tariff Billing, and ML Forecasting",
+        version="2.1.0"
     )
 
     app.add_middleware(
@@ -28,6 +43,12 @@ if FASTAPI_AVAILABLE:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    if DATABASE_AVAILABLE:
+        try:
+            init_database()
+        except Exception as e:
+            print(f"Database initialization warning: {e}")
 
     # --- Pydantic Data Models ---
     class SlabModel(BaseModel):
@@ -74,6 +95,33 @@ if FASTAPI_AVAILABLE:
         killPhantomLoad: bool = True
         bldcFanUpgrade: bool = False
         solarCapacityKw: float = 0.0
+
+    # User Auth & Isolation Models
+    class RegisterRequest(BaseModel):
+        email: str
+        username: str
+        fullName: str
+        password: str
+        consumerId: str
+        tariffId: Optional[str] = "in_residential"
+        currency: Optional[str] = "INR"
+        budget: Optional[float] = 3200.0
+        defaultAppliances: Optional[List[Dict[str, Any]]] = None
+
+    class LoginRequest(BaseModel):
+        identifier: str
+        password: str
+
+    class UpdateProfileRequest(BaseModel):
+        tariffId: Optional[str] = None
+        currency: Optional[str] = None
+        budget: Optional[float] = None
+        mtdUnits: Optional[float] = None
+        solarActive: Optional[bool] = None
+        appliedActions: Optional[Dict[str, Any]] = None
+
+    class SyncAppliancesRequest(BaseModel):
+        appliances: List[Dict[str, Any]]
 
     # --- Calculation Helper Functions ---
     def compute_itemized_bill(total_units: float, tariff: TariffModel, solar_offset: float = 0.0):
@@ -131,16 +179,87 @@ if FASTAPI_AVAILABLE:
     def root():
         return {
             "system": "VoltWise AI - Backend API Gateway",
-            "version": "2.0.0",
+            "version": "2.1.0",
             "status": "online",
+            "database": "SQLite (Multi-User Partitioned)",
             "endpoints": [
+                "/api/auth/accounts",
+                "/api/auth/register",
+                "/api/auth/login",
+                "/api/user/{user_id}",
                 "/api/bill/calculate",
                 "/api/ml/predict",
-                "/api/ai/recommendations",
                 "/api/simulator/what-if"
             ]
         }
 
+    # === Authentication & Multi-Account Endpoints ===
+    @app.get("/api/auth/accounts")
+    def get_accounts():
+        """Lists available accounts for fast profile switching."""
+        if not DATABASE_AVAILABLE:
+            raise HTTPException(status_code=500, detail="Database module not available")
+        return {"accounts": list_all_users()}
+
+    @app.post("/api/auth/register")
+    def register_endpoint(req: RegisterRequest):
+        """Creates a separate account with dedicated database isolation."""
+        if not DATABASE_AVAILABLE:
+            raise HTTPException(status_code=500, detail="Database module not available")
+        try:
+            user = create_user(
+                email=req.email,
+                username=req.username,
+                full_name=req.fullName,
+                password=req.password,
+                consumer_id=req.consumerId,
+                tariff_id=req.tariffId or "in_residential",
+                currency=req.currency or "INR",
+                budget=req.budget or 3200.0,
+                default_appliances=req.defaultAppliances
+            )
+            return {"status": "success", "user": user}
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.post("/api/auth/login")
+    def login_endpoint(req: LoginRequest):
+        """Authenticates user and returns their isolated data."""
+        if not DATABASE_AVAILABLE:
+            raise HTTPException(status_code=500, detail="Database module not available")
+        user = authenticate_user(req.identifier, req.password)
+        if not user:
+            raise HTTPException(status_code=401, detail="Invalid email/consumer ID or password")
+        return {"status": "success", "user": user}
+
+    @app.get("/api/user/{user_id}")
+    def get_user_data(user_id: str):
+        """Retrieves user settings and appliances from database."""
+        if not DATABASE_AVAILABLE:
+            raise HTTPException(status_code=500, detail="Database module not available")
+        user = get_user_by_id(user_id)
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        return {"status": "success", "user": user}
+
+    @app.put("/api/user/{user_id}/profile")
+    def update_profile(user_id: str, req: UpdateProfileRequest):
+        """Updates user's tariff, currency, budget, and solar state."""
+        if not DATABASE_AVAILABLE:
+            raise HTTPException(status_code=500, detail="Database module not available")
+        updates = req.dict(exclude_unset=True)
+        update_user_profile(user_id, updates)
+        return {"status": "success", "user": get_user_by_id(user_id)}
+
+    @app.put("/api/user/{user_id}/appliances")
+    def update_appliances(user_id: str, req: SyncAppliancesRequest):
+        """Saves user's isolated appliance inventory in database."""
+        if not DATABASE_AVAILABLE:
+            raise HTTPException(status_code=500, detail="Database module not available")
+        sync_user_appliances(user_id, req.appliances)
+        return {"status": "success", "user": get_user_by_id(user_id)}
+
+    # === Computational & ML Endpoints ===
     @app.post("/api/bill/calculate")
     def calculate_bill_endpoint(req: CalculateBillRequest):
         """Calculates telescopic slab bill, fixed charges, and taxes"""
@@ -204,7 +323,6 @@ if FASTAPI_AVAILABLE:
         }
 
 if __name__ == "__main__":
-    import sys
     if FASTAPI_AVAILABLE:
         import uvicorn
         print("Starting VoltWise AI Backend API Server on http://127.0.0.1:8000 ...")

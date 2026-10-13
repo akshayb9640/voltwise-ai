@@ -1,10 +1,11 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import './App.css';
 
 import { TARIFF_PRESETS, INITIAL_APPLIANCES, HISTORICAL_MONTHS } from './data/defaultData';
 import { calculateBill, projectMonthlyBill } from './utils/tariffCalculator';
 import { generateMLPredictions, calculateApplianceBreakdown, detectAnomalies } from './utils/mlPredictor';
 import { generateRecommendations } from './utils/aiAdvisor';
+import { dbService } from './services/apiService';
 
 import { Header } from './components/Header';
 import { TopMetrics } from './components/TopMetrics';
@@ -16,15 +17,21 @@ import { BillPredictorView } from './components/BillPredictorView';
 import { AIAdvisorView } from './components/AIAdvisorView';
 import { WhatIfSimulator } from './components/WhatIfSimulator';
 import { BillStatementView } from './components/BillStatementView';
+import { AuthModal } from './components/AuthModal';
+import { Database, UserCheck, Check, Sparkles } from 'lucide-react';
 
 export default function App() {
-  // 1. Core State
+  // 1. Account & Database State
+  const [currentUser, setCurrentUser] = useState(null);
+  const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
+  const [dbNotice, setDbNotice] = useState('');
+
+  // 2. Core User Configuration State (Partitioned per User)
   const [tariffId, setTariffId] = useState('in_residential');
   const [currency, setCurrency] = useState('INR');
   const [appliances, setAppliances] = useState(INITIAL_APPLIANCES);
   const [activeTab, setActiveTab] = useState('live_power');
   const [isLiveSimulation, setIsLiveSimulation] = useState(false);
-  const [microNoise, setMicroNoise] = useState(0);
   const [solarActive, setSolarActive] = useState(false);
   const [appliedActions, setAppliedActions] = useState({});
   const [budget, setBudget] = useState(3200);
@@ -33,6 +40,60 @@ export default function App() {
   const dayOfMonth = 18;
   const daysInMonth = 30;
   const [mtdUnits, setMtdUnits] = useState(198.4);
+
+  // Show transient database sync notice
+  const showDbNotice = useCallback((text) => {
+    setDbNotice(text);
+    setTimeout(() => {
+      setDbNotice('');
+    }, 2800);
+  }, []);
+
+  // Initialize and load the active user's isolated data from database
+  useEffect(() => {
+    async function loadActiveUserData() {
+      try {
+        const user = await dbService.getCurrentUser();
+        if (user) {
+          const userData = await dbService.loadUserData(user.id);
+          setCurrentUser(userData.user);
+          if (userData.profile) {
+            if (userData.profile.tariffId) setTariffId(userData.profile.tariffId);
+            if (userData.profile.currency) setCurrency(userData.profile.currency);
+            if (userData.profile.budget) setBudget(userData.profile.budget);
+            if (userData.profile.mtdUnits) setMtdUnits(userData.profile.mtdUnits);
+            setSolarActive(Boolean(userData.profile.solarActive));
+            if (userData.profile.appliedActions) setAppliedActions(userData.profile.appliedActions);
+          }
+          if (userData.appliances && userData.appliances.length > 0) {
+            setAppliances(userData.appliances);
+          }
+        }
+      } catch (err) {
+        console.error('Error loading user database partition:', err);
+      }
+    }
+    loadActiveUserData();
+  }, []);
+
+  // Handler when user switches account or registers a new account
+  const handleAccountSwitched = (fullData) => {
+    setCurrentUser(fullData.user);
+    if (fullData.profile) {
+      if (fullData.profile.tariffId) setTariffId(fullData.profile.tariffId);
+      if (fullData.profile.currency) setCurrency(fullData.profile.currency);
+      if (fullData.profile.budget) setBudget(fullData.profile.budget);
+      if (fullData.profile.mtdUnits) setMtdUnits(userDataFix(fullData.profile.mtdUnits));
+      setSolarActive(Boolean(fullData.profile.solarActive));
+      if (fullData.profile.appliedActions) setAppliedActions(fullData.profile.appliedActions);
+    }
+    if (fullData.appliances && fullData.appliances.length > 0) {
+      setAppliances(fullData.appliances);
+    }
+    showDbNotice(`Loaded database record for ${fullData.user.fullName}`);
+  };
+
+  const userDataFix = (val) => (typeof val === 'number' ? val : 198.4);
 
   // Active Tariff with currency override if user toggles currency
   const tariff = useMemo(() => {
@@ -50,14 +111,38 @@ export default function App() {
     return base;
   }, [tariffId, currency]);
 
-  // Adjust budget currency defaults
-  useEffect(() => {
-    if (currency === 'USD') setBudget(160);
-    else if (currency === 'EUR') setBudget(140);
-    else setBudget(3200);
-  }, [currency]);
+  // Sync profile changes to user's database record
+  const handleSelectTariff = (newTariffId) => {
+    setTariffId(newTariffId);
+    if (currentUser?.id) {
+      dbService.saveUserProfile(currentUser.id, { tariffId: newTariffId });
+      showDbNotice('DISCOM tariff updated in database');
+    }
+  };
 
-  // 2. Compute Active Power Draw (kW) - completely steady based on appliances
+  const handleSelectCurrency = (newCurrency) => {
+    setCurrency(newCurrency);
+    let newBudget = budget;
+    if (newCurrency === 'USD') newBudget = 160;
+    else if (newCurrency === 'EUR') newBudget = 140;
+    else newBudget = 3200;
+    setBudget(newBudget);
+
+    if (currentUser?.id) {
+      dbService.saveUserProfile(currentUser.id, { currency: newCurrency, budget: newBudget });
+      showDbNotice('Currency updated in database');
+    }
+  };
+
+  const handleToggleSolar = (newVal) => {
+    setSolarActive(newVal);
+    if (currentUser?.id) {
+      dbService.saveUserProfile(currentUser.id, { solarActive: newVal });
+      showDbNotice(`Solar net-metering ${newVal ? 'enabled' : 'disabled'} in database`);
+    }
+  };
+
+  // 2. Compute Active Power Draw (kW)
   const baseLiveWatts = useMemo(() => {
     return appliances.reduce((sum, a) => {
       if (a.isOn) {
@@ -102,151 +187,166 @@ export default function App() {
 
   const totalPossibleSavings = recommendations.reduce((sum, r) => sum + r.monthlyCostSavings, 0);
 
-  // Handlers for Appliance Controls
+  // Database-Synced Appliance Handlers
+  const persistAppliances = (newAppliances, noticeText = 'Database updated') => {
+    setAppliances(newAppliances);
+    if (currentUser?.id) {
+      dbService.saveUserAppliances(currentUser.id, newAppliances);
+      showDbNotice(noticeText);
+    }
+  };
+
   const handleToggleAppliance = (appId) => {
-    setAppliances(prev =>
-      prev.map(a => a.id === appId ? { ...a, isOn: !a.isOn } : a)
-    );
+    const updated = appliances.map(a => a.id === appId ? { ...a, isOn: !a.isOn } : a);
+    persistAppliances(updated, 'Appliance power state saved');
   };
 
   const handleUpdateHours = (appId, newHours) => {
-    setAppliances(prev =>
-      prev.map(a => a.id === appId ? { ...a, dailyHours: newHours } : a)
-    );
+    const updated = appliances.map(a => a.id === appId ? { ...a, dailyHours: newHours } : a);
+    persistAppliances(updated, 'Operating hours saved to database');
   };
 
   const handleUpdateAppliance = (appId, updates) => {
-    setAppliances(prev =>
-      prev.map(a => a.id === appId ? { ...a, ...updates } : a)
-    );
+    const updated = appliances.map(a => a.id === appId ? { ...a, ...updates } : a);
+    persistAppliances(updated, 'Appliance parameters saved to database');
   };
 
   const handleAddAppliance = (newApp) => {
-    setAppliances(prev => [newApp, ...prev]);
+    const updated = [newApp, ...appliances];
+    persistAppliances(updated, `Added "${newApp.name}" to your database`);
   };
 
   // Handler for Applying AI Recommendations
   const handleApplyRecommendation = (actionKey) => {
     if (!actionKey) return;
-    setAppliedActions(prev => ({ ...prev, [actionKey]: true }));
+    const newActions = { ...appliedActions, [actionKey]: true };
+    setAppliedActions(newActions);
+
+    let updatedAppliances = [...appliances];
+    let newMtd = mtdUnits;
 
     if (actionKey === 'SET_AC_24') {
-      setAppliances(prev =>
-        prev.map(a => {
-          if (a.category === 'Climate') {
-            return {
-              ...a,
-              tempSetpoint: 24,
-              dutyCycle: Math.max(0.55, (a.dutyCycle || 0.8) * 0.84),
-              ecoMode: true
-            };
-          }
-          return a;
-        })
-      );
-      setMtdUnits(prev => Math.max(10, prev - 12));
+      updatedAppliances = updatedAppliances.map(a => {
+        if (a.category === 'Climate') {
+          return {
+            ...a,
+            tempSetpoint: 24,
+            dutyCycle: Math.max(0.55, (a.dutyCycle || 0.8) * 0.84),
+            ecoMode: true
+          };
+        }
+        return a;
+      });
+      newMtd = Math.max(10, newMtd - 12);
+      setMtdUnits(newMtd);
     }
 
     if (actionKey === 'OPTIMIZE_GEYSER') {
-      setAppliances(prev =>
-        prev.map(a => {
-          if (a.name.toLowerCase().includes('geyser') || a.name.toLowerCase().includes('water heater')) {
-            return { ...a, dailyHours: 0.8, smartSchedule: true };
-          }
-          return a;
-        })
-      );
-      setMtdUnits(prev => Math.max(10, prev - 8));
+      updatedAppliances = updatedAppliances.map(a => {
+        if (a.name.toLowerCase().includes('geyser') || a.name.toLowerCase().includes('water heater')) {
+          return { ...a, dailyHours: 0.8, smartSchedule: true };
+        }
+        return a;
+      });
+      newMtd = Math.max(10, newMtd - 8);
+      setMtdUnits(newMtd);
     }
 
     if (actionKey === 'CUT_PHANTOM') {
-      setAppliances(prev =>
-        prev.map(a => ({
-          ...a,
-          standbyWatts: a.standbyWatts > 10 ? 2 : a.standbyWatts,
-          vampirePowerAlert: false
-        }))
-      );
-      setMtdUnits(prev => Math.max(10, prev - 6));
+      updatedAppliances = updatedAppliances.map(a => ({
+        ...a,
+        standbyWatts: a.standbyWatts > 10 ? 2 : a.standbyWatts,
+        vampirePowerAlert: false
+      }));
+      newMtd = Math.max(10, newMtd - 6);
+      setMtdUnits(newMtd);
     }
 
     if (actionKey === 'SHIFT_PEAK') {
-      setAppliances(prev =>
-        prev.map(a => {
-          if (a.category === 'Utilities') {
-            return { ...a, peakHours: 0, smartSchedule: true };
-          }
-          return a;
-        })
-      );
+      updatedAppliances = updatedAppliances.map(a => {
+        if (a.category === 'Utilities') {
+          return { ...a, peakHours: 0, smartSchedule: true };
+        }
+        return a;
+      });
     }
 
     if (actionKey === 'UPGRADE_BLDC') {
-      setAppliances(prev =>
-        prev.map(a => {
-          if (a.name.toLowerCase().includes('fan')) {
-            return {
-              ...a,
-              name: 'Ceiling Fans (5x BLDC 28W Ultra-Efficient)',
-              ratedWatts: 140,
-              starRating: 5
-            };
-          }
-          return a;
-        })
-      );
+      updatedAppliances = updatedAppliances.map(a => {
+        if (a.name.toLowerCase().includes('fan')) {
+          return {
+            ...a,
+            name: 'Ceiling Fans (5x BLDC 28W Ultra-Efficient)',
+            ratedWatts: 140,
+            starRating: 5
+          };
+        }
+        return a;
+      });
     }
 
     if (actionKey === 'ENABLE_SOLAR' || actionKey === 'TOGGLE_SOLAR') {
-      setSolarActive(true);
+      handleToggleSolar(true);
+    }
+
+    persistAppliances(updatedAppliances, `AI recommendation applied & saved`);
+    if (currentUser?.id) {
+      dbService.saveUserProfile(currentUser.id, {
+        appliedActions: newActions,
+        mtdUnits: newMtd
+      });
     }
   };
 
   // Handler for What-If Scenario Commits
   const handleApplyScenario = (scenario) => {
-    setAppliances(prev =>
-      prev.map(a => {
-        let updated = { ...a };
-        if (a.category === 'Climate') {
-          updated.dailyHours = Math.max(0, updated.dailyHours - scenario.acHoursReduction);
-          updated.tempSetpoint = scenario.acSetpoint;
-          updated.dutyCycle = Math.max(0.5, 0.70 - ((scenario.acSetpoint - 22) * 0.05));
-        }
-        if (a.name.toLowerCase().includes('geyser')) {
-          updated.dailyHours = Math.max(0.5, updated.dailyHours - (scenario.cutGeyserMinutes / 60));
-        }
-        if (scenario.killPhantomLoad && updated.standbyWatts > 10) {
-          updated.standbyWatts = 2;
-        }
-        if (scenario.bldcFanUpgrade && updated.name.toLowerCase().includes('fan')) {
-          updated.ratedWatts = 140;
-          updated.starRating = 5;
-        }
-        return updated;
-      })
-    );
+    const updated = appliances.map(a => {
+      let item = { ...a };
+      if (a.category === 'Climate') {
+        item.dailyHours = Math.max(0, item.dailyHours - scenario.acHoursReduction);
+        item.tempSetpoint = scenario.acSetpoint;
+        item.dutyCycle = Math.max(0.5, 0.70 - ((scenario.acSetpoint - 22) * 0.05));
+      }
+      if (a.name.toLowerCase().includes('geyser')) {
+        item.dailyHours = Math.max(0.5, item.dailyHours - (scenario.cutGeyserMinutes / 60));
+      }
+      if (scenario.killPhantomLoad && item.standbyWatts > 10) {
+        item.standbyWatts = 2;
+      }
+      if (scenario.bldcFanUpgrade && item.name.toLowerCase().includes('fan')) {
+        item.ratedWatts = 140;
+        item.starRating = 5;
+      }
+      return item;
+    });
 
     if (scenario.solarCapacityKw > 0) {
-      setSolarActive(true);
+      handleToggleSolar(true);
     }
+
+    persistAppliances(updated, 'Custom scenario committed to your database');
   };
 
-  const handleResetData = () => {
-    setAppliances(INITIAL_APPLIANCES);
-    setMtdUnits(198.4);
-    setAppliedActions({});
-    setSolarActive(false);
+  const handleResetData = async () => {
+    if (currentUser?.id) {
+      const reset = await dbService.resetUserData(currentUser.id);
+      setAppliances(reset.appliances);
+      setMtdUnits(reset.profile.mtdUnits);
+      setAppliedActions({});
+      setSolarActive(reset.profile.solarActive);
+      showDbNotice(`Reset data for ${currentUser.fullName} to default baseline`);
+    }
   };
 
   return (
     <div className="app-wrapper">
-      {/* 1. Header Bar */}
+      {/* 1. Header Bar with User Account & Database Integration */}
       <Header
         tariff={tariff}
-        onSelectTariff={setTariffId}
+        onSelectTariff={handleSelectTariff}
         tariffPresets={TARIFF_PRESETS}
         currency={currency}
-        onSelectCurrency={setCurrency}
+        onSelectCurrency={handleSelectCurrency}
         liveKw={liveKw}
         anomaliesCount={anomalies.length}
         onOpenReport={() => setActiveTab('bill_statement')}
@@ -255,9 +355,47 @@ export default function App() {
         setIsLiveSimulation={setIsLiveSimulation}
         budget={budget}
         projectedCost={projectedData.projectedBill.totalBill}
+        currentUser={currentUser}
+        onOpenAuthModal={() => setIsAuthModalOpen(true)}
       />
 
-      {/* 2. Top Summary KPI Bar (Clean & Compact) */}
+      {/* User Account Notification & Database Sync Bar */}
+      <div className="account-context-strip glass-panel">
+        <div className="account-context-left">
+          <div 
+            className="user-strip-avatar"
+            style={{ backgroundColor: currentUser?.avatarColor || '#00F2FE' }}
+          >
+            {currentUser?.fullName?.charAt(0) || 'U'}
+          </div>
+          <div className="account-strip-details">
+            <span className="account-strip-name">
+              Logged in as: <strong>{currentUser?.fullName || 'Guest User'}</strong>
+            </span>
+            <span className="account-strip-meta font-mono">
+              Account ID: {currentUser?.consumerId || 'CONS-DEMO'} • Tariff: {tariff.name}
+            </span>
+          </div>
+        </div>
+
+        <div className="account-context-right">
+          {dbNotice && (
+            <div className="db-save-toast animate-fade-in">
+              <Check size={14} className="text-emerald" />
+              <span>{dbNotice}</span>
+            </div>
+          )}
+          <button 
+            className="btn-secondary btn-sm"
+            onClick={() => setIsAuthModalOpen(true)}
+          >
+            <UserCheck size={14} />
+            <span>Switch Account / Add User</span>
+          </button>
+        </div>
+      </div>
+
+      {/* 2. Top Summary KPI Bar */}
       <TopMetrics
         liveKw={liveKw}
         mtdUnits={mtdUnits}
@@ -274,7 +412,7 @@ export default function App() {
         onOpenOptimizer={() => setActiveTab('ai_savings')}
       />
 
-      {/* 3. Navigation Tabs (7 Distinct Types of Data) */}
+      {/* 3. Navigation Tabs */}
       <NavigationTabs
         activeTab={activeTab}
         setActiveTab={setActiveTab}
@@ -282,7 +420,7 @@ export default function App() {
         recsCount={recommendations.length}
       />
 
-      {/* 4. Tab Content Views - Each Tab Has Its Own Dedicated Screen */}
+      {/* 4. Tab Content Views */}
       <main className="tab-main-content">
         {/* Tab 1: Live Power Draw Right Now */}
         {activeTab === 'live_power' && (
@@ -299,7 +437,7 @@ export default function App() {
         {activeTab === 'hourly_usage' && (
           <HourlyLoadChart
             solarActive={solarActive}
-            onToggleSolar={setSolarActive}
+            onToggleSolar={handleToggleSolar}
             tariff={tariff}
           />
         )}
@@ -338,7 +476,7 @@ export default function App() {
             projectedData={projectedData}
             liveKw={liveKw}
             solarActive={solarActive}
-            onToggleSolar={setSolarActive}
+            onToggleSolar={handleToggleSolar}
           />
         )}
 
@@ -362,6 +500,15 @@ export default function App() {
           />
         )}
       </main>
+
+      {/* 5. User Account & Database Modal */}
+      <AuthModal
+        isOpen={isAuthModalOpen}
+        onClose={() => setIsAuthModalOpen(false)}
+        currentUser={currentUser}
+        onAccountSwitched={handleAccountSwitched}
+        dbService={dbService}
+      />
     </div>
   );
 }

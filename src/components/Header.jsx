@@ -1,5 +1,5 @@
 import React from 'react';
-import { Zap, Sun, ShieldAlert, FileText, RefreshCw, SlidersHorizontal } from 'lucide-react';
+import { Zap, ShieldAlert, FileText, RefreshCw, UserCheck, Database, ChevronDown } from 'lucide-react';
 
 export function Header({
   tariff,
@@ -14,10 +14,13 @@ export function Header({
   isLiveSimulation,
   setIsLiveSimulation,
   budget,
-  projectedCost
+  projectedCost,
+  currentUser,
+  onOpenAuthModal
 }) {
   const isOverBudget = projectedCost > budget;
   const budgetPct = Math.min(100, Math.round((projectedCost / budget) * 100));
+  const userInitial = currentUser?.fullName?.charAt(0) || 'U';
 
   return (
     <header className="header-container glass-panel">
@@ -40,6 +43,17 @@ export function Header({
             <span className="status-dot animate-live-dot"></span>
             <span className="status-text">METER ACTIVE • 230V / 50Hz</span>
           </div>
+
+          {/* Database & Account Status Pill */}
+          <div 
+            className="db-status-pill cursor-pointer"
+            onClick={onOpenAuthModal}
+            title="Click to view database partition or switch account"
+          >
+            <Database size={13} className="text-cyan animate-pulse" />
+            <span className="font-mono text-xs text-cyan">DB ISOLATED</span>
+          </div>
+
           {anomaliesCount > 0 && (
             <div className="anomaly-pill">
               <ShieldAlert size={14} className="text-amber" />
@@ -50,6 +64,29 @@ export function Header({
       </div>
 
       <div className="header-right">
+        {/* User Account / Profile Dropdown Trigger */}
+        <div 
+          className="header-user-badge cursor-pointer"
+          onClick={onOpenAuthModal}
+          title="Click to switch account or manage database profile"
+        >
+          <div 
+            className="user-badge-avatar"
+            style={{ backgroundColor: currentUser?.avatarColor || '#00F2FE' }}
+          >
+            {userInitial}
+          </div>
+          <div className="user-badge-info">
+            <div className="user-badge-name-row">
+              <span className="user-badge-name">{currentUser?.fullName || 'Guest User'}</span>
+              <ChevronDown size={13} className="text-muted" />
+            </div>
+            <span className="user-badge-consumer font-mono">
+              {currentUser?.consumerId || 'CONS-UNREGISTERED'}
+            </span>
+          </div>
+        </div>
+
         {/* Budget Progress Meter */}
         <div className="header-budget-widget">
           <div className="budget-label-row">
